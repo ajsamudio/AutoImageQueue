@@ -66,6 +66,36 @@ if (!window.__AUTOQUE_LOADED__) {
     try { return document.querySelectorAll(sel).length; } catch (e) { return 0; }
   }
 
+  // ---------- host-aware "is a generation running?" ----------
+  // Some apps only allow ONE generation at a time and don't disable their
+  // Generate button, so we can't rely on the button state or on a single picked
+  // badge — their status text changes mid-run (Higgsfield: "Generating" then
+  // "Processing"). For these hosts we detect "busy" by the presence of ANY
+  // in-progress status badge, so the next prompt isn't submitted until the
+  // current video is done. Other hosts (Google Flow) have no entry here and are
+  // completely unaffected.
+  const BUSY_WORDS = {
+    'higgsfield.ai': ['processing', 'generating', 'queued', 'in queue', 'starting', 'rendering', 'uploading']
+  };
+
+  function hostBusy() {
+    const words = BUSY_WORDS[location.host];
+    if (!words) return false;
+    // Status badges are short, text-only leaf elements. Match by text presence
+    // (not visibility) — Higgsfield's container queries can hide the label while
+    // a generation is still running.
+    const nodes = document.querySelectorAll('span, div, p');
+    for (const el of nodes) {
+      if (el.childElementCount > 0) continue;            // leaf (text-bearing) only
+      const t = (el.textContent || '').trim().toLowerCase();
+      if (!t || t.length > 24) continue;                 // skip big containers
+      for (let i = 0; i < words.length; i++) {
+        if (t === words[i] || t.startsWith(words[i])) return true;
+      }
+    }
+    return false;
+  }
+
   // ---------- selector building / resolving ----------
   // We store, for each target, an object: { css, text, tag, ariaLabel }.
   // At runtime we try the CSS path first, then fall back to a text/aria match,
@@ -108,7 +138,8 @@ if (!window.__AUTOQUE_LOADED__) {
       css: cssPath(el),
       text,
       tag: el.tagName.toLowerCase(),
-      ariaLabel: el.getAttribute('aria-label') || ''
+      ariaLabel: el.getAttribute('aria-label') || '',
+      classes: el.getAttribute('class') || ''
     };
   }
 
@@ -140,6 +171,40 @@ if (!window.__AUTOQUE_LOADED__) {
       if (found) return found;
     }
     return null;
+  }
+
+  // ---------- result image capture ----------
+  // Gather URLs of result images currently on the page. When the user has
+  // picked a result thumbnail we scope to elements sharing that tile's CSS
+  // class (the results grid); otherwise we fall back to every reasonably-large
+  // <img>. We diff this before vs. after a generation to grab the new image.
+  function collectResultImages(selectors) {
+    let scopes = [];
+    const r = selectors && selectors.results;
+    if (r && r.classes) {
+      const sel = (r.tag || '*') + '.' +
+        r.classes.trim().split(/\s+/).map((c) => CSS.escape(c)).join('.');
+      try { scopes = Array.from(document.querySelectorAll(sel)); } catch (e) { scopes = []; }
+    }
+    if (!scopes.length) {
+      const one = resolveEl(r);
+      scopes = one ? [one] : [document.body];
+    }
+    const urls = [];
+    const seen = new Set();
+    scopes.forEach((scope) => {
+      const imgs = (scope.tagName === 'IMG') ? [scope] : Array.from(scope.querySelectorAll('img'));
+      imgs.forEach((img) => {
+        const src = img.currentSrc || img.src || '';
+        if (!/^https?:/i.test(src) || seen.has(src)) return;
+        const w = img.naturalWidth || img.width;
+        const h = img.naturalHeight || img.height;
+        if (w < 100 || h < 100) return; // skip icons / UI chrome
+        seen.add(src);
+        urls.push(src);
+      });
+    });
+    return urls;
   }
 
   // ---------- typing into the input ----------
@@ -304,6 +369,24 @@ if (!window.__AUTOQUE_LOADED__) {
     // Give the UI a moment to enter its "busy" state before we test for "done".
     await sleepA(grace);
 
+    // Hosts with a known in-progress badge (e.g. Higgsfield) override the chosen
+    // mode: wait for the badge to APPEAR (proves the submit actually started a
+    // generation — the prompt box doesn't clear there) then to CLEAR (proves it
+    // finished). The clear is what enforces one-at-a-time.
+    if (BUSY_WORDS[location.host]) {
+      const secsH = Math.round(max / 1000);
+      const appeared = await until(hostBusy, Math.min(20000, max), pollMs);
+      if (!appeared) {
+        throw new Error('Generation never started — no "Processing"/"Generating" badge appeared after submitting. Re-pick the Generate button, or set Submit method to "Both".');
+      }
+      const cleared = await until(() => !hostBusy(), max, pollMs);
+      if (!cleared) {
+        throw new Error('Still generating after ' + secsH + 's — raise "Max wait per prompt".');
+      }
+      await sleepA(settings.settleMs || 1500);
+      return;
+    }
+
     const mode = settings.mode || 'fixed';
 
     if (mode === 'fixed') {
@@ -320,11 +403,21 @@ if (!window.__AUTOQUE_LOADED__) {
       const ok = await until(() => countSel(sel) > before, max, pollMs);
       if (!ok) throw new Error('No new result appeared within ' + secs + 's — the generation likely never started (prompt not submitted).');
     } else if (mode === 'busy' && selectors.busy) {
-      const sel = selectors.busy.css || selectors.busy;
-      // Wait for the busy indicator to first appear (briefly), then disappear.
-      await until(() => visible(document.querySelector(sel)), Math.min(8000, max), pollMs);
-      const cleared = await until(() => !visible(document.querySelector(sel)), max, pollMs);
-      if (!cleared) throw new Error('Busy indicator never cleared within ' + secs + 's.');
+      // Resolve the indicator each poll through CSS *and* the text/aria fallback,
+      // so a dynamic badge (e.g. Higgsfield's "Generating") is still found when
+      // its exact DOM path shifts between generations.
+      const isBusy = () => { const el = resolveEl(selectors.busy); return !!(el && visible(el)); };
+      // The indicator APPEARING is our proof the submit actually started a
+      // generation — on apps that keep the prompt text (Higgsfield) this replaces
+      // the box-clears check. If it never shows, the click didn't take.
+      const appeared = await until(isBusy, Math.min(20000, max), pollMs);
+      if (!appeared) {
+        throw new Error('Generation never started — the busy indicator never appeared after submitting. Re-pick the Generate button (or the busy indicator), or set Submit method to "Both".');
+      }
+      // Now wait for it to clear — this is what enforces "one at a time": the next
+      // prompt is not submitted until the current video has finished.
+      const cleared = await until(() => !isBusy(), max, pollMs);
+      if (!cleared) throw new Error('Busy indicator never cleared within ' + secs + 's — raise "Max wait per prompt".');
     } else if (mode === 'enabled') {
       const target = () => resolveEl(selectors.generate) || genEl;
       // Wait for it to look busy (disabled), then enabled again.
@@ -402,12 +495,17 @@ if (!window.__AUTOQUE_LOADED__) {
     document.addEventListener('keydown', key, true);
   }
 
+  // Save picks keyed by the page's host so teaching one site (e.g. Higgsfield)
+  // never clobbers the picks already learned for another (e.g. Google Flow).
   function saveSelector(target, info) {
     return new Promise((resolve) => {
-      chrome.storage.local.get(['selectors'], (data) => {
-        const selectors = data.selectors || {};
-        selectors[target] = info;
-        chrome.storage.local.set({ selectors }, () => resolve());
+      const host = location.host;
+      chrome.storage.local.get(['selectorsByHost'], (data) => {
+        const byHost = data.selectorsByHost || {};
+        const forHost = byHost[host] || {};
+        forHost[target] = info;
+        byHost[host] = forHost;
+        chrome.storage.local.set({ selectorsByHost: byHost }, () => resolve());
       });
     });
   }
@@ -442,6 +540,25 @@ if (!window.__AUTOQUE_LOADED__) {
             const picked = resolveEl(msg.selectors.input);
             if (!picked) throw new Error('Prompt input not found — re-pick the prompt field.');
             const editable = findEditable(picked) || picked;
+
+            // One-at-a-time apps (e.g. Higgsfield): never start typing/submitting
+            // while a generation is still running, or the new submit is rejected
+            // ("concurrent" error / refunded credits). Wait for the app to go idle
+            // first. Sites without a busy signal skip this instantly.
+            const pageBusy = () => {
+              if (msg.selectors.busy) {
+                const b = resolveEl(msg.selectors.busy);
+                if (b && visible(b)) return true;
+              }
+              return hostBusy();
+            };
+            if (pageBusy()) {
+              await until(() => !pageBusy(), msg.settings.maxWaitMs || 180000, msg.settings.pollMs || 600);
+            }
+
+            // Snapshot the result images already on the page so we can identify
+            // the one THIS prompt produces (anything new after it finishes).
+            const beforeImages = new Set(collectResultImages(msg.selectors));
 
             // Focus the box with a REAL mouse click (CDP). JS .focus() is not
             // reliable for Flow's editor, and CDP keystrokes go to whatever is
@@ -478,14 +595,30 @@ if (!window.__AUTOQUE_LOADED__) {
             // never started. The box can take a second or two to clear, so POLL for
             // it rather than checking once — a single early check produced false
             // "not submitted" errors on prompts that did in fact go through.
-            const confirmMs = msg.settings.submitConfirmMs || 6000;
-            const submitted = await until(() => currentText(editable).trim() === '', confirmMs, 250);
-            if (!submitted) {
-              throw new Error('Typed but not submitted — box still full after ' + Math.round(confirmMs / 1000) + 's (Generate stayed disabled). Re-pick the Generate button, or set Submit method to "Both".');
+            //
+            // Some apps (e.g. Higgsfield) KEEP the prompt text after submitting, so
+            // this check would false-error there. Skip it for known one-at-a-time
+            // hosts (their generation start is confirmed by the busy badge instead)
+            // and when the user sets "Confirm submission" to "Don't verify".
+            const skipClearCheck = msg.settings.submitConfirm === 'none' || !!BUSY_WORDS[location.host];
+            if (!skipClearCheck) {
+              const confirmMs = msg.settings.submitConfirmMs || 6000;
+              const submitted = await until(() => currentText(editable).trim() === '', confirmMs, 250);
+              if (!submitted) {
+                throw new Error('Typed but not submitted — box still full after ' + Math.round(confirmMs / 1000) + 's (Generate stayed disabled). Re-pick the Generate button, set Submit method to "Both", or set Confirm submission to "Don\'t verify".');
+              }
             }
 
             await waitForReady(genEl, msg.settings, msg.selectors);
-            sendResponse({ ok: true });
+
+            // Capture the image(s) that appeared since we started — these are the
+            // result of this prompt. Best-effort: a miss just means no download.
+            let images = [];
+            try {
+              images = collectResultImages(msg.selectors).filter((u) => !beforeImages.has(u));
+            } catch (e) { /* ignore */ }
+
+            sendResponse({ ok: true, images });
           } catch (e) {
             sendResponse({ ok: false, error: e.message || String(e) });
           }

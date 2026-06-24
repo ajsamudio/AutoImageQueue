@@ -9,14 +9,14 @@
 <body>
   <header>
     <h1>AutoQuePrompt</h1>
-    <span class="tag">Google Flow batch queue</span>
+    <span class="tag">Google Flow &amp; Higgsfield batch queue</span>
   </header>
 
   <!-- 1. Connect + teach selectors -->
   <section class="card">
     <div class="card-title">1 · Connect</div>
     <button id="connectBtn" class="btn">Connect to current tab</button>
-    <div id="connStatus" class="status muted">Open Google Flow in a tab, then click Connect.</div>
+    <div id="connStatus" class="status muted">Open Google Flow or Higgsfield in a tab, then click Connect.</div>
 
     <div class="pick-row">
       <button id="pickInput" class="btn ghost" disabled>Pick prompt field</button>
@@ -56,7 +56,10 @@ Prompt 3"></textarea>
 
   <!-- Queue list -->
   <section class="card">
-    <div class="card-title">Queue</div>
+    <div class="card-title queue-head">
+      <span>Queue</span>
+      <button id="downloadAllBtn" class="btn ghost small" disabled>Download all</button>
+    </div>
     <ol id="queueList" class="queue"></ol>
   </section>
 
@@ -95,6 +98,14 @@ Prompt 3"></textarea>
         <option value="button">Click Generate button</option>
         <option value="enter">Press Enter</option>
         <option value="both">Both</option>
+      </select>
+    </label>
+
+    <label class="field">
+      <span>Confirm submission</span>
+      <select id="submitConfirm">
+        <option value="clear">Prompt box clears after submit (Google Flow)</option>
+        <option value="none">Don't verify — box keeps text (Higgsfield)</option>
       </select>
     </label>
 

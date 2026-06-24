@@ -134,6 +134,14 @@ textarea:focus { outline: 1px solid var(--accent); }
   font: inherit;
 }
 
+.queue-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.queue-head .btn { width: auto; }
+
 .queue {
   list-style: none;
   margin: 0;
@@ -186,6 +194,22 @@ textarea:focus { outline: 1px solid var(--accent); }
 .badge.running { background: #1d3a5f; color: var(--accent); animation: pulse 1.2s infinite; }
 .badge.done { background: #143726; color: var(--green); }
 .badge.error { background: #3a1f23; color: var(--red); }
+
+.queue li .dl {
+  flex: 0 0 auto;
+  align-self: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--accent);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+.queue li .dl:hover { filter: brightness(1.3); }
 
 li.running { outline: 1px solid var(--accent); }
 

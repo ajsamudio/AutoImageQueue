@@ -5,9 +5,20 @@ const $ = (id) => document.getElementById(id);
 
 // ---------- state ----------
 let connectedTabId = null;
-let selectors = {};            // { input, generate, results, busy }
+let connectedHost = null;      // host of the connected tab (e.g. labs.google, higgsfield.ai)
+let selectorsByHost = {};      // { "labs.google": {...}, "higgsfield.ai": {...} }
+let legacySelectors = {};      // pre-1.7 flat picks, used as a fallback per host
+let selectors = {};            // active picks for the connected host: { input, generate, results, busy }
 let queue = [];                // [{ id, text, status }]
 let running = false;
+
+// Active picks = this host's own picks, else the legacy (pre-per-host) picks.
+// The fallback means an existing Flow setup keeps working until re-picked.
+function recomputeSelectors() {
+  selectors = (connectedHost && selectorsByHost[connectedHost]) || legacySelectors || {};
+  renderSelectorChecks();
+  updateControls();
+}
 
 const els = {
   connectBtn: $('connectBtn'),
@@ -27,6 +38,7 @@ const els = {
   stopBtn: $('stopBtn'),
   resetBtn: $('resetBtn'),
   clearBtn: $('clearBtn'),
+  downloadAllBtn: $('downloadAllBtn'),
   progress: $('progress'),
   runStatus: $('runStatus'),
   queueList: $('queueList'),
@@ -34,7 +46,8 @@ const els = {
   secondsPerPrompt: $('secondsPerPrompt'),
   maxWaitSec: $('maxWaitSec'),
   delaySec: $('delaySec'),
-  submitMethod: $('submitMethod')
+  submitMethod: $('submitMethod'),
+  submitConfirm: $('submitConfirm')
 };
 
 // ---------- helpers ----------
@@ -54,6 +67,7 @@ function getSettings() {
     maxWaitMs: (Number(els.maxWaitSec.value) || 180) * 1000,
     delayBetweenMs: Math.round((Number(els.delaySec.value) || 0) * 1000),
     submitMethod: els.submitMethod.value,
+    submitConfirm: els.submitConfirm.value,
     pollMs: 600,
     busyGraceMs: 1500,
     settleMs: 1500,
@@ -90,20 +104,22 @@ function persist() {
   chrome.storage.local.set({
     queue,
     connectedTabId,
+    connectedHost,
     promptText: els.prompts.value,
     uiSettings: {
       mode: els.mode.value,
       secondsPerPrompt: els.secondsPerPrompt.value,
       maxWaitSec: els.maxWaitSec.value,
       delaySec: els.delaySec.value,
-      submitMethod: els.submitMethod.value
+      submitMethod: els.submitMethod.value,
+      submitConfirm: els.submitConfirm.value
     }
   });
 }
 
 function restore() {
   chrome.storage.local.get(
-    ['queue', 'connectedTabId', 'promptText', 'uiSettings', 'selectors'],
+    ['queue', 'connectedTabId', 'connectedHost', 'promptText', 'uiSettings', 'selectors', 'selectorsByHost'],
     (data) => {
       if (Array.isArray(data.queue)) {
         queue = data.queue.map((q) => ({
@@ -112,6 +128,7 @@ function restore() {
         }));
       }
       if (typeof data.connectedTabId === 'number') connectedTabId = data.connectedTabId;
+      if (typeof data.connectedHost === 'string') connectedHost = data.connectedHost;
       if (typeof data.promptText === 'string') els.prompts.value = data.promptText;
       if (data.uiSettings) {
         const s = data.uiSettings;
@@ -120,11 +137,13 @@ function restore() {
         if (s.maxWaitSec) els.maxWaitSec.value = s.maxWaitSec;
         if (s.delaySec) els.delaySec.value = s.delaySec;
         if (s.submitMethod) els.submitMethod.value = s.submitMethod;
+        if (s.submitConfirm) els.submitConfirm.value = s.submitConfirm;
       }
-      selectors = data.selectors || {};
+      legacySelectors = data.selectors || {};
+      selectorsByHost = data.selectorsByHost || {};
       updatePromptCount();
       renderQueue();
-      renderSelectorChecks();
+      recomputeSelectors();
       if (connectedTabId != null) verifyConnection();
       updateControls();
     }
@@ -133,11 +152,10 @@ function restore() {
 
 // Keep selectors in sync if the content script writes a pick.
 chrome.storage.onChanged.addListener((changes, area) => {
-  if (area === 'local' && changes.selectors) {
-    selectors = changes.selectors.newValue || {};
-    renderSelectorChecks();
-    updateControls();
-  }
+  if (area !== 'local') return;
+  if (changes.selectorsByHost) selectorsByHost = changes.selectorsByHost.newValue || {};
+  if (changes.selectors) legacySelectors = changes.selectors.newValue || {};
+  if (changes.selectorsByHost || changes.selectors) recomputeSelectors();
 });
 
 // ---------- rendering ----------
@@ -160,6 +178,12 @@ function renderQueue() {
   const done = queue.filter((q) => q.status === 'done').length;
   els.progress.textContent = `${done} / ${queue.length}`;
 
+  const withImages = queue.filter((q) => q.images && q.images.length).length;
+  if (els.downloadAllBtn) {
+    els.downloadAllBtn.disabled = withImages === 0;
+    els.downloadAllBtn.textContent = withImages ? `Download all (${withImages})` : 'Download all';
+  }
+
   if (!queue.length) {
     els.queueList.innerHTML = '<div class="empty">No prompts loaded yet.</div>';
     return;
@@ -180,6 +204,14 @@ function renderQueue() {
     badge.textContent = item.status;
     if (item.status === 'error' && item.error) badge.title = item.error;
     li.append(num, txt, badge);
+    if (item.images && item.images.length) {
+      const dl = document.createElement('button');
+      dl.className = 'dl';
+      dl.textContent = '⬇';
+      dl.title = `Download ${item.images.length} image${item.images.length > 1 ? 's' : ''} as ${baseNameFor(item, i)}`;
+      dl.addEventListener('click', () => downloadOne(item, i));
+      li.append(dl);
+    }
     els.queueList.append(li);
   });
 }
@@ -216,7 +248,7 @@ async function connect() {
   try {
     await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['content.js'] });
   } catch (e) {
-    els.connStatus.textContent = 'Cannot inject into this tab (' + e.message + '). Open Flow in a normal https tab.';
+    els.connStatus.textContent = 'Cannot inject into this tab (' + e.message + '). Open Flow or Higgsfield in a normal https tab.';
     els.connStatus.className = 'status err';
     return;
   }
@@ -225,8 +257,10 @@ async function connect() {
     connectedTabId = tab.id;
     let host = '';
     try { host = new URL(resp.url).host; } catch (e) {}
+    connectedHost = host || null;
     els.connStatus.textContent = 'Connected to ' + (host || ('tab ' + tab.id));
     els.connStatus.className = 'status ok';
+    recomputeSelectors(); // load this site's own picks
     persist();
     updateControls();
   } else {
@@ -240,11 +274,13 @@ async function verifyConnection() {
   if (resp && resp.ok) {
     let host = '';
     try { host = new URL(resp.url).host; } catch (e) {}
+    connectedHost = host || connectedHost;
     els.connStatus.textContent = 'Connected to ' + (host || ('tab ' + connectedTabId));
     els.connStatus.className = 'status ok';
+    recomputeSelectors(); // load this site's own picks
   } else {
     connectedTabId = null;
-    els.connStatus.textContent = 'Previous tab is gone. Click Connect on your Flow tab.';
+    els.connStatus.textContent = 'Previous tab is gone. Click Connect on your Flow or Higgsfield tab.';
     els.connStatus.className = 'status muted';
   }
   updateControls();
@@ -310,6 +346,7 @@ async function start() {
 
     if (resp && resp.ok) {
       item.status = 'done';
+      item.images = Array.isArray(resp.images) ? resp.images : [];
     } else {
       item.status = 'error';
       item.error = (resp && resp.error) || 'Unknown error';
@@ -372,6 +409,71 @@ function clearQueue() {
   setRunStatus('Queue cleared.', 'muted');
 }
 
+// ---------- downloading ----------
+// Build a filename from the prompt's leading [mm:ss] timestamp, e.g.
+// "[00:03] Hand-drawn…" -> "[00-03]" (':' is illegal in filenames).
+// Falls back to the queue position when no timestamp is present.
+function baseNameFor(item, index) {
+  const m = item.text.match(/\[\s*(\d{1,2})\s*:\s*(\d{2})\s*\]/);
+  if (m) return `[${m[1].padStart(2, '0')}-${m[2]}]`;
+  return 'prompt-' + String(index + 1).padStart(3, '0');
+}
+
+function sanitize(name) {
+  return name.replace(/[\\/:*?"<>|]/g, '-').replace(/\s+/g, ' ').trim();
+}
+
+function extFor(url) {
+  const m = (url.split(/[?#]/)[0] || '').match(/\.(png|jpe?g|webp|gif|avif)$/i);
+  return m ? m[0].toLowerCase() : '.png';
+}
+
+function triggerDownload(url, filename) {
+  return new Promise((resolve) => {
+    chrome.downloads.download({ url, filename, conflictAction: 'uniquify' }, () => {
+      void chrome.runtime.lastError; // tab/session may block some URLs; best-effort
+      resolve();
+    });
+  });
+}
+
+// Download every image captured for `items`, naming each by its prompt's
+// [mm:ss]. `used` keeps names unique across the batch.
+async function downloadItems(items, used) {
+  let count = 0;
+  for (const { item, index } of items) {
+    if (!item.images || !item.images.length) continue;
+    let base = baseNameFor(item, index);
+    while (used.has(base)) base += '_'; // de-dup across duplicate timestamps
+    used.add(base);
+    for (let j = 0; j < item.images.length; j++) {
+      const suffix = item.images.length > 1 ? ` (${j + 1})` : '';
+      const filename = sanitize(base + suffix) + extFor(item.images[j]);
+      await triggerDownload(item.images[j], filename);
+      count++;
+      await sleep(150); // stagger so Chrome doesn't drop rapid-fire downloads
+    }
+  }
+  return count;
+}
+
+async function downloadAll() {
+  const items = queue
+    .map((item, index) => ({ item, index }))
+    .filter(({ item }) => item.images && item.images.length);
+  if (!items.length) {
+    setRunStatus('No images captured yet — run the queue first (and pick a result thumbnail for best results).', 'muted');
+    return;
+  }
+  const n = await downloadItems(items, new Set());
+  setRunStatus(`Started ${n} download(s).`, 'ok');
+}
+
+async function downloadOne(item, index) {
+  const n = await downloadItems([{ item, index }], new Set());
+  setRunStatus(n ? `Started ${n} download(s).` : 'No image to download for this prompt.', n ? 'ok' : 'muted');
+}
+
 // ---------- wiring ----------
 els.connectBtn.addEventListener('click', connect);
 els.pickInput.addEventListener('click', () => pick('input'));
@@ -383,8 +485,9 @@ els.startBtn.addEventListener('click', start);
 els.stopBtn.addEventListener('click', stop);
 els.resetBtn.addEventListener('click', resetStatuses);
 els.clearBtn.addEventListener('click', clearQueue);
+els.downloadAllBtn.addEventListener('click', downloadAll);
 els.prompts.addEventListener('input', () => { updatePromptCount(); persist(); });
-[els.mode, els.secondsPerPrompt, els.maxWaitSec, els.delaySec, els.submitMethod]
+[els.mode, els.secondsPerPrompt, els.maxWaitSec, els.delaySec, els.submitMethod, els.submitConfirm]
   .forEach((el) => el.addEventListener('change', persist));
 
 restore();

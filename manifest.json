@@ -1,12 +1,14 @@
 {
   "manifest_version": 3,
-  "name": "AutoQuePrompt for Google Flow",
-  "version": "1.5.0",
-  "description": "Queue a list of prompts and auto-generate them one-by-one in Google Flow. Paste prompts separated by blank lines, press Start, walk away.",
-  "permissions": ["storage", "sidePanel", "scripting", "activeTab", "tabs", "debugger"],
+  "name": "AutoQuePrompt for Google Flow & Higgsfield",
+  "version": "1.7.2",
+  "description": "Queue a list of prompts and auto-generate them one-by-one in Google Flow or Higgsfield. Paste prompts separated by blank lines, press Start, walk away.",
+  "permissions": ["storage", "sidePanel", "scripting", "activeTab", "tabs", "debugger", "downloads"],
   "host_permissions": [
     "https://labs.google/*",
-    "https://*.google.com/*"
+    "https://*.google.com/*",
+    "https://higgsfield.ai/*",
+    "https://*.higgsfield.ai/*"
   ],
   "background": {
     "service_worker": "background.js"
@@ -19,7 +21,12 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://labs.google/*", "https://gemini.google.com/*"],
+      "matches": [
+        "https://labs.google/*",
+        "https://gemini.google.com/*",
+        "https://higgsfield.ai/*",
+        "https://*.higgsfield.ai/*"
+      ],
       "js": ["content.js"],
       "run_at": "document_idle",
       "all_frames": false
