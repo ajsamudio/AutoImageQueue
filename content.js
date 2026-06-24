@@ -475,10 +475,13 @@ if (!window.__AUTOQUE_LOADED__) {
 
             // Confirm the submission was ACCEPTED. Flow clears the prompt box on a
             // successful submit; if our text is still sitting there, the generation
-            // never started — so this prompt is a failure, not a success.
-            await sleep(900);
-            if (currentText(editable).trim() !== '') {
-              throw new Error('Typed but not submitted — box still full (Generate stayed disabled). Re-pick the Generate button, or set Submit method to "Both".');
+            // never started. The box can take a second or two to clear, so POLL for
+            // it rather than checking once — a single early check produced false
+            // "not submitted" errors on prompts that did in fact go through.
+            const confirmMs = msg.settings.submitConfirmMs || 6000;
+            const submitted = await until(() => currentText(editable).trim() === '', confirmMs, 250);
+            if (!submitted) {
+              throw new Error('Typed but not submitted — box still full after ' + Math.round(confirmMs / 1000) + 's (Generate stayed disabled). Re-pick the Generate button, or set Submit method to "Both".');
             }
 
             await waitForReady(genEl, msg.settings, msg.selectors);

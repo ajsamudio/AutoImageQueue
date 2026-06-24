@@ -56,7 +56,8 @@ function getSettings() {
     submitMethod: els.submitMethod.value,
     pollMs: 600,
     busyGraceMs: 1500,
-    settleMs: 1500
+    settleMs: 1500,
+    submitConfirmMs: 6000  // how long to wait for Flow to clear the box before calling it a failed submit
   };
 }
 
