@@ -39,15 +39,19 @@ const els = {
   resetBtn: $('resetBtn'),
   clearBtn: $('clearBtn'),
   downloadAllBtn: $('downloadAllBtn'),
+  downloadPageBtn: $('downloadPageBtn'),
   progress: $('progress'),
   runStatus: $('runStatus'),
   queueList: $('queueList'),
   mode: $('mode'),
   secondsPerPrompt: $('secondsPerPrompt'),
   maxWaitSec: $('maxWaitSec'),
+  maxConcurrent: $('maxConcurrent'),
+  resultOrder: $('resultOrder'),
   delaySec: $('delaySec'),
   submitMethod: $('submitMethod'),
-  submitConfirm: $('submitConfirm')
+  submitConfirm: $('submitConfirm'),
+  autoSave: $('autoSave')
 };
 
 // ---------- helpers ----------
@@ -61,13 +65,20 @@ function parsePrompts(text) {
 }
 
 function getSettings() {
+  // 0 = unlimited (blast: submit everything as fast as possible, no throttle).
+  // Note: plain `|| 1` would wrongly coerce a valid 0 to 1, so parse explicitly.
+  const mcRaw = Number(els.maxConcurrent.value);
+  const maxConcurrent = Number.isFinite(mcRaw) && mcRaw >= 0 ? Math.floor(mcRaw) : 1;
   return {
     mode: els.mode.value,
     secondsPerPrompt: Number(els.secondsPerPrompt.value) || 30,
     maxWaitMs: (Number(els.maxWaitSec.value) || 180) * 1000,
+    maxConcurrent,
+    resultOrder: els.resultOrder.value,
     delayBetweenMs: Math.round((Number(els.delaySec.value) || 0) * 1000),
     submitMethod: els.submitMethod.value,
     submitConfirm: els.submitConfirm.value,
+    autoSave: !!els.autoSave.checked,
     pollMs: 600,
     busyGraceMs: 1500,
     settleMs: 1500,
@@ -110,9 +121,12 @@ function persist() {
       mode: els.mode.value,
       secondsPerPrompt: els.secondsPerPrompt.value,
       maxWaitSec: els.maxWaitSec.value,
+      maxConcurrent: els.maxConcurrent.value,
+      resultOrder: els.resultOrder.value,
       delaySec: els.delaySec.value,
       submitMethod: els.submitMethod.value,
-      submitConfirm: els.submitConfirm.value
+      submitConfirm: els.submitConfirm.value,
+      autoSave: els.autoSave.checked
     }
   });
 }
@@ -135,9 +149,12 @@ function restore() {
         if (s.mode) els.mode.value = s.mode;
         if (s.secondsPerPrompt) els.secondsPerPrompt.value = s.secondsPerPrompt;
         if (s.maxWaitSec) els.maxWaitSec.value = s.maxWaitSec;
+        if (s.maxConcurrent) els.maxConcurrent.value = s.maxConcurrent;
+        if (s.resultOrder) els.resultOrder.value = s.resultOrder;
         if (s.delaySec) els.delaySec.value = s.delaySec;
         if (s.submitMethod) els.submitMethod.value = s.submitMethod;
         if (s.submitConfirm) els.submitConfirm.value = s.submitConfirm;
+        if (typeof s.autoSave === 'boolean') els.autoSave.checked = s.autoSave;
       }
       legacySelectors = data.selectors || {};
       selectorsByHost = data.selectorsByHost || {};
@@ -192,13 +209,21 @@ function renderQueue() {
   queue.forEach((item, i) => {
     const li = document.createElement('li');
     if (item.status === 'running') li.classList.add('running');
-    const preview = item.text.length > 160 ? item.text.slice(0, 160) + '…' : item.text;
     const num = document.createElement('div');
     num.className = 'num';
     num.textContent = i + 1;
     const txt = document.createElement('div');
     txt.className = 'txt';
-    txt.textContent = preview;
+    if (item.label) {              // "[mm:ss] Scene_Name" — names the saved file
+      const lbl = document.createElement('div');
+      lbl.className = 'label';
+      lbl.textContent = item.label;
+      txt.append(lbl);
+    }
+    const body = document.createElement('div');
+    body.className = 'body';
+    body.textContent = item.text;  // the prompt actually sent to Flow; scrolls on its own
+    txt.append(body);
     const badge = document.createElement('div');
     badge.className = 'badge ' + item.status;
     badge.textContent = item.status;
@@ -319,6 +344,34 @@ async function start() {
   updateControls();
   const settings = getSettings();
 
+  // Shared across this run so auto-saved filenames stay unique (e.g. repeated
+  // scene names get _2, _3 …).
+  const usedNames = new Set();
+
+  try {
+    // 1 = sequential (wait for each). 0 (unlimited/blast) or >1 = concurrent.
+    if (settings.maxConcurrent === 1) await runSequential(settings, usedNames);
+    else await runConcurrent(settings, usedNames);
+  } finally {
+    running = false;
+    detachDebugger();
+    updateControls();
+    const remaining = queue.filter((q) => q.status === 'pending').length;
+    const errors = queue.filter((q) => q.status === 'error').length;
+    if (!els.runStatus.classList.contains('err')) {
+      setRunStatus(
+        remaining === 0
+          ? `Finished. ${queue.filter((q) => q.status === 'done').length} done${errors ? ', ' + errors + ' errors' : ''}.`
+          : `Stopped. ${remaining} still pending.`,
+        remaining === 0 && !errors ? 'ok' : 'muted'
+      );
+    }
+  }
+}
+
+// Sequential: one prompt at a time, each waiting for its generation to finish
+// (content-side RUN_ONE) before the next is submitted.
+async function runSequential(settings, usedNames) {
   for (let i = 0; i < queue.length; i++) {
     if (!running) break;
     const item = queue[i];
@@ -347,6 +400,8 @@ async function start() {
     if (resp && resp.ok) {
       item.status = 'done';
       item.images = Array.isArray(resp.images) ? resp.images : [];
+      // Save this generation's image immediately, named by its label.
+      if (settings.autoSave) await autoSave(item, i, usedNames);
     } else {
       item.status = 'error';
       item.error = (resp && resp.error) || 'Unknown error';
@@ -359,19 +414,195 @@ async function start() {
       await sleep(settings.delayBetweenMs);
     }
   }
+}
 
-  running = false;
-  detachDebugger();
-  updateControls();
-  const remaining = queue.filter((q) => q.status === 'pending').length;
-  const errors = queue.filter((q) => q.status === 'error').length;
-  if (!els.runStatus.classList.contains('err')) {
-    setRunStatus(
-      remaining === 0
-        ? `Finished. ${queue.filter((q) => q.status === 'done').length} done${errors ? ', ' + errors + ' errors' : ''}.`
-        : `Stopped. ${remaining} still pending.`,
-      remaining === 0 && !errors ? 'ok' : 'muted'
-    );
+// Concurrent: submit up to `maxConcurrent` prompts before waiting, so the app
+// renders several generations in parallel. We can't ask the page which finished
+// image belongs to which prompt, so we rely on gallery ordering: the app lists
+// results by CREATION time, so the final set of new images — ordered oldest →
+// newest — lines up 1:1 with prompts in submission order (robust even if they
+// finish out of order). The "Result order" setting flips the direction if a
+// site lists oldest-first. Assumes ~one image per prompt.
+async function runConcurrent(settings, usedNames) {
+  // 0 = unlimited: never throttle, submit everything back-to-back (blast mode).
+  const cap = settings.maxConcurrent > 0 ? settings.maxConcurrent : Infinity;
+
+  const snapshot = async () => {
+    const r = await sendToTab(connectedTabId, { type: 'SNAPSHOT', selectors });
+    return {
+      images: (r && Array.isArray(r.images)) ? r.images : [],
+      slots: (r && Array.isArray(r.slots)) ? r.slots : null,
+      failed: (r && Number.isFinite(r.failed)) ? r.failed : 0
+    };
+  };
+
+  // Everything already on the page is "old" — new results appear beyond this.
+  const baselineSnap = await snapshot();
+  const baselineImages = new Set(baselineSnap.images);
+  const baselineFailed = baselineSnap.failed;
+  const newOnly = (imgs) => imgs.filter((u) => !baselineImages.has(u));
+
+  // Prompts to run, in submission order.
+  const targets = [];
+  for (let i = 0; i < queue.length; i++) if (queue[i].status !== 'done') targets.push(i);
+  if (!targets.length) return;
+
+  let submitted = 0;            // SUBMIT_ONE calls issued
+  let completed = 0;            // terminal results (images + rejected gens) seen
+  let failed = 0;              // submit-time failures (produced no tile at all)
+  const submitFailed = new Set(); // queue indices whose submit itself failed
+  const total = targets.length;
+  // Generous overall safety net so a stuck generation can't hang forever.
+  const deadline = Date.now() + (settings.maxWaitMs || 180000) * (total + 1);
+
+  let lastSnap = baselineSnap;  // most recent SNAPSHOT, reused for attribution
+  let stopped = false;
+  let lastPollAt = 0;
+
+  // Prompts whose submit succeeded (so the site produced a tile for them), in
+  // submission order. These line up 1:1 with the terminal tiles below.
+  const submittedTargets = () =>
+    targets.slice(0, submitted).filter((qi) => !submitFailed.has(qi));
+
+  // The NEW terminal outcomes (images and rejected generations) since the batch
+  // began, in submission order. Prefers per-tile slots so a rejected tile keeps
+  // its slot — without that, every later image would be misattributed by one.
+  // Falls back to image URLs + an (unpositioned) failure count when no result
+  // thumbnail is picked. The gallery is creation-ordered, so oldest = earliest.
+  const computeOutcomes = () => {
+    if (Array.isArray(lastSnap.slots)) {
+      let ordered = lastSnap.slots;
+      if ((settings.resultOrder || 'newest') === 'newest') ordered = ordered.slice().reverse();
+      // Now oldest-first; pre-batch tiles sit at the front, so skip the failures
+      // that were already there and keep images we haven't seen before.
+      let skipFailed = baselineFailed;
+      const list = [];
+      for (const s of ordered) {
+        if (s.kind === 'image') {
+          if (!baselineImages.has(s.url)) list.push(s);
+        } else if (s.kind === 'failed') {
+          if (skipFailed > 0) skipFailed--;
+          else list.push(s);
+        }
+      }
+      return { list, exact: true, newFailed: 0, terminal: list.length };
+    }
+    let fresh = newOnly(lastSnap.images);
+    if ((settings.resultOrder || 'newest') === 'newest') fresh = fresh.slice().reverse();
+    const list = fresh.map((url) => ({ kind: 'image', url }));
+    const newFailed = Math.max(0, lastSnap.failed - baselineFailed);
+    return { list, exact: false, newFailed, terminal: list.length + newFailed };
+  };
+
+  // Map outcomes onto prompts. Called live (isFinal=false) to flip each prompt
+  // to done/error as its tile resolves — so early generations don't sit on
+  // "running" through a long blast — and once at the end (isFinal=true) to also
+  // settle prompts that produced no capturable tile.
+  const attribute = (isFinal, outcomes) => {
+    const { list, exact, newFailed } = outcomes;
+    const sub = submittedTargets();
+    let pendingFailures = exact ? 0 : newFailed;
+    for (let k = 0; k < sub.length; k++) {
+      const qi = sub[k];
+      const slot = list[k];
+      if (slot && slot.kind === 'image') {
+        queue[qi].status = 'done';
+        queue[qi].images = [slot.url];
+      } else if (slot && slot.kind === 'failed') {
+        queue[qi].status = 'error';
+        queue[qi].error = 'Generation rejected by the site (e.g. policy block) — re-run this prompt.';
+      } else if (isFinal) {
+        if (!exact && pendingFailures > 0) {
+          // Image-only fallback: we know N generations failed but not which, so
+          // flag the leftover (image-less) prompts. Pick a result thumbnail for
+          // exact pairing.
+          queue[qi].status = 'error';
+          queue[qi].error = 'Generation failed — no image returned. Re-run this prompt.';
+          pendingFailures--;
+        } else if (stopped) {
+          queue[qi].status = 'pending';   // never captured; let the user re-run it
+        } else {
+          queue[qi].status = 'done';      // finished but no image captured to download
+          queue[qi].images = queue[qi].images || [];
+        }
+      }
+    }
+  };
+
+  // Snapshot the page (throttled to pollMs) and refresh live statuses so the
+  // queue reflects what's actually finished — even while still submitting.
+  const poll = async (force) => {
+    const now = Date.now();
+    if (!force && now - lastPollAt < (settings.pollMs || 600)) return;
+    lastPollAt = now;
+    lastSnap = await snapshot();
+    const outcomes = computeOutcomes();
+    completed = Math.min(outcomes.terminal, total - failed);
+    attribute(false, outcomes);
+    renderQueue();
+    persist();
+  };
+
+  while (running && (submitted < total || completed < submitted - failed)) {
+    // Fill the pipeline up to the concurrency cap (in-flight = submitted - completed - failed).
+    while (running && submitted < total && (submitted - completed - failed) < cap) {
+      const qi = targets[submitted];
+      queue[qi].status = 'running';
+      queue[qi].error = undefined;
+      renderQueue();
+      persist();
+      setRunStatus(`Submitting ${submitted + 1}/${total} · ${submitted - completed - failed} generating…`, 'muted');
+
+      const resp = await sendToTab(connectedTabId, {
+        type: 'SUBMIT_ONE',
+        text: queue[qi].text,
+        selectors,
+        settings
+      });
+      if (!resp || !resp.ok) {
+        queue[qi].status = 'error';
+        queue[qi].error = (resp && resp.error) || 'Submit failed';
+        failed++;
+        submitFailed.add(qi);
+        renderQueue();
+        persist();
+      }
+      submitted++;
+      // Advance generations that have already finished so early prompts don't
+      // stay "running" while the rest of the blast is still being submitted.
+      await poll();
+      if (running && settings.delayBetweenMs > 0) await sleep(settings.delayBetweenMs);
+    }
+
+    if (!running) break;
+
+    // Wait for more results to land (frees a slot / advances completion).
+    await sleep(Math.max(800, settings.pollMs || 1000));
+    await poll(true);
+    if (completed > 0) setRunStatus(`Generating… ${completed}/${total - failed} finished`, 'muted');
+    if (Date.now() > deadline) {
+      setRunStatus('Timed out waiting for generations to finish.', 'err');
+      break;
+    }
+  }
+
+  // Final pass: fresh snapshot, then resolve every submitted prompt.
+  stopped = !running;
+  lastSnap = await snapshot();
+  const finalOutcomes = computeOutcomes();
+  completed = Math.min(finalOutcomes.terminal, total - failed);
+  attribute(true, finalOutcomes);
+  renderQueue();
+  persist();
+
+  // Auto-save every captured image once attribution has settled, named by each
+  // prompt's label. Done at the end (not live) because concurrent attribution
+  // can shift a slot until the batch finishes. Iterates in queue order so names
+  // are assigned deterministically.
+  if (settings.autoSave) {
+    for (let i = 0; i < queue.length; i++) await autoSave(queue[i], i, usedNames);
+    renderQueue();
+    persist();
   }
 }
 
@@ -384,9 +615,25 @@ async function stop() {
 }
 
 // ---------- queue editing ----------
+// Split a queue line on the FIRST " | " (space-pipe-space) into its label and
+// the actual prompt:
+//   "[00:09] Dark_cave | Hand-drawn doodle…"
+//     -> label "[00:09] Dark_cave", text "Hand-drawn doodle…"
+// Only `text` is ever typed into Flow; `label` is kept solely to name the saved
+// image. A line with no " | " is treated wholly as the prompt (label null), so
+// older queues and un-labelled prompts keep working unchanged.
+function splitLabel(line) {
+  const i = line.indexOf(' | ');
+  if (i === -1) return { label: null, text: line };
+  return { label: line.slice(0, i).trim() || null, text: line.slice(i + 3).trim() };
+}
+
 function loadQueue() {
-  const prompts = parsePrompts(els.prompts.value);
-  queue = prompts.map((text, i) => ({ id: Date.now() + '_' + i, text, status: 'pending' }));
+  const lines = parsePrompts(els.prompts.value);
+  queue = lines.map((line, i) => {
+    const { label, text } = splitLabel(line);
+    return { id: Date.now() + '_' + i, text, label, status: 'pending' };
+  });
   renderQueue();
   persist();
   updateControls();
@@ -394,7 +641,7 @@ function loadQueue() {
 }
 
 function resetStatuses() {
-  queue.forEach((q) => { q.status = 'pending'; q.error = undefined; });
+  queue.forEach((q) => { q.status = 'pending'; q.error = undefined; q.downloaded = false; });
   renderQueue();
   persist();
   updateControls();
@@ -410,10 +657,16 @@ function clearQueue() {
 }
 
 // ---------- downloading ----------
-// Build a filename from the prompt's leading [mm:ss] timestamp, e.g.
-// "[00:03] Hand-drawn…" -> "[00-03]" (':' is illegal in filenames).
-// Falls back to the queue position when no timestamp is present.
+// Build a filename base for a queue item, in priority order:
+//   1. The parsed "[mm:ss] Scene_Name" label — sanitize() swaps the ':' for '-'
+//      (illegal in Windows filenames), giving "[mm-ss] Scene_Name".
+//   2. Backward compatible: a leading [mm:ss] found inside the prompt text.
+//   3. Last resort: the queue position ("prompt-007").
 function baseNameFor(item, index) {
+  if (item && item.label) {
+    const base = sanitize(item.label);
+    if (base) return base;
+  }
   const m = item.text.match(/\[\s*(\d{1,2})\s*:\s*(\d{2})\s*\]/);
   if (m) return `[${m[1].padStart(2, '0')}-${m[2]}]`;
   return 'prompt-' + String(index + 1).padStart(3, '0');
@@ -421,6 +674,16 @@ function baseNameFor(item, index) {
 
 function sanitize(name) {
   return name.replace(/[\\/:*?"<>|]/g, '-').replace(/\s+/g, ' ').trim();
+}
+
+// Make `base` unique within the `used` set, appending _2, _3, … on repeats
+// (e.g. two scenes that share a name). Records the chosen name in `used`.
+function uniqueName(base, used) {
+  let name = base;
+  let n = 2;
+  while (used.has(name)) name = `${base}_${n++}`;
+  used.add(name);
+  return name;
 }
 
 function extFor(url) {
@@ -437,24 +700,40 @@ function triggerDownload(url, filename) {
   });
 }
 
-// Download every image captured for `items`, naming each by its prompt's
-// [mm:ss]. `used` keeps names unique across the batch.
+// Download every image captured for ONE item, named by its "[mm-ss] Scene_Name"
+// label (de-duplicated against `used`). Returns how many downloads were started.
+async function downloadItemImages(item, index, used) {
+  if (!item.images || !item.images.length) return 0;
+  const base = uniqueName(baseNameFor(item, index), used);
+  let count = 0;
+  for (let j = 0; j < item.images.length; j++) {
+    const suffix = item.images.length > 1 ? ` (${j + 1})` : '';
+    const filename = sanitize(base + suffix) + extFor(item.images[j]);
+    await triggerDownload(item.images[j], filename);
+    count++;
+    await sleep(150); // stagger so Chrome doesn't drop rapid-fire downloads
+  }
+  return count;
+}
+
+// Download every image captured for `items`. `used` keeps names unique.
 async function downloadItems(items, used) {
   let count = 0;
   for (const { item, index } of items) {
-    if (!item.images || !item.images.length) continue;
-    let base = baseNameFor(item, index);
-    while (used.has(base)) base += '_'; // de-dup across duplicate timestamps
-    used.add(base);
-    for (let j = 0; j < item.images.length; j++) {
-      const suffix = item.images.length > 1 ? ` (${j + 1})` : '';
-      const filename = sanitize(base + suffix) + extFor(item.images[j]);
-      await triggerDownload(item.images[j], filename);
-      count++;
-      await sleep(150); // stagger so Chrome doesn't drop rapid-fire downloads
-    }
+    count += await downloadItemImages(item, index, used);
   }
   return count;
+}
+
+// Auto-save: as soon as an item finishes with a captured image, download it
+// named by its label — no manual renaming. The `downloaded` flag (persisted)
+// stops a panel reopen / resume from saving the same image twice; `used` keeps
+// names unique within the run.
+async function autoSave(item, index, used) {
+  if (!item || !item.images || !item.images.length || item.downloaded) return 0;
+  const n = await downloadItemImages(item, index, used);
+  if (n) item.downloaded = true;
+  return n;
 }
 
 async function downloadAll() {
@@ -474,6 +753,70 @@ async function downloadOne(item, index) {
   setRunStatus(n ? `Started ${n} download(s).` : 'No image to download for this prompt.', n ? 'ok' : 'muted');
 }
 
+// Rescue download: grab every result on the page via the browser's own
+// downloader, regardless of queue status or attribution. Works even when a run
+// got stuck on "running" and never attached images to items. Because galleries
+// virtualize (only nearby tiles stay loaded), this scrolls the whole gallery
+// and accumulates ordered slots (image|failed) via HARVEST rather than a single
+// snapshot. Failed cells keep their position, so names stay aligned with the
+// queue 1:1 — failures are skipped and reported by their [mm:ss]. Also syncs the
+// queue (done/error) so it matches the page afterward.
+//
+// Tip: pick a result thumbnail (Settings) so HARVEST scopes to real result
+// tiles — otherwise stray page images can sneak in and shift the alignment.
+async function downloadPageResults() {
+  if (connectedTabId == null) { setRunStatus('Connect to the Flow tab first.', 'err'); return; }
+  els.downloadPageBtn.disabled = true;
+  setRunStatus('Scrolling the gallery to load every result… (don\'t switch tabs or scroll)', 'muted');
+  let slots = [];
+  try {
+    const r = await sendToTab(connectedTabId, {
+      type: 'HARVEST',
+      selectors,
+      settings: { harvestDelayMs: 450, harvestMaxMs: 180000 }
+    });
+    if (r && Array.isArray(r.slots)) slots = r.slots;
+    else if (r && Array.isArray(r.images)) slots = r.images.map((u) => ({ kind: 'image', url: u }));
+  } finally {
+    els.downloadPageBtn.disabled = false;
+  }
+  // HARVEST returns top→bottom order. Newest-first galleries (Flow's default)
+  // list the latest generation first, so reverse to oldest-first = prompt order.
+  if ((els.resultOrder.value || 'newest') === 'newest') slots = slots.slice().reverse();
+  if (!slots.length) { setRunStatus('No results found on the page.', 'muted'); return; }
+
+  const used = new Set();
+  let n = 0;
+  const failedNames = [];
+  for (let i = 0; i < slots.length; i++) {
+    const s = slots[i];
+    const item = queue[i];
+    if (s.kind === 'failed') {
+      if (item) {
+        item.status = 'error';
+        item.error = 'Generation rejected by the site (e.g. policy block) — re-run this prompt.';
+        item.images = [];
+        failedNames.push(baseNameFor(item, i));
+      }
+      continue; // no image to download; the slot still holds its position
+    }
+    if (item) { item.status = 'done'; item.images = [s.url]; item.downloaded = true; }
+    const rawBase = item ? baseNameFor(item, i) : 'result-' + String(i + 1).padStart(3, '0');
+    const base = uniqueName(rawBase, used);
+    await triggerDownload(s.url, sanitize(base) + extFor(s.url));
+    n++;
+    await sleep(150); // stagger so Chrome doesn't drop rapid-fire downloads
+  }
+  renderQueue();
+  persist();
+
+  let msg = `Started ${n} download(s) from the page.`;
+  if (failedNames.length) msg += ` ${failedNames.length} failed (now red): ${failedNames.join(', ')}.`;
+  const accounted = n + failedNames.length;
+  if (accounted !== queue.length) msg += ` Accounted for ${accounted} of ${queue.length} — pick a result thumbnail and retry if that looks off.`;
+  setRunStatus(msg, failedNames.length ? 'muted' : 'ok');
+}
+
 // ---------- wiring ----------
 els.connectBtn.addEventListener('click', connect);
 els.pickInput.addEventListener('click', () => pick('input'));
@@ -486,8 +829,9 @@ els.stopBtn.addEventListener('click', stop);
 els.resetBtn.addEventListener('click', resetStatuses);
 els.clearBtn.addEventListener('click', clearQueue);
 els.downloadAllBtn.addEventListener('click', downloadAll);
+els.downloadPageBtn.addEventListener('click', downloadPageResults);
 els.prompts.addEventListener('input', () => { updatePromptCount(); persist(); });
-[els.mode, els.secondsPerPrompt, els.maxWaitSec, els.delaySec, els.submitMethod, els.submitConfirm]
+[els.mode, els.secondsPerPrompt, els.maxWaitSec, els.maxConcurrent, els.resultOrder, els.delaySec, els.submitMethod, els.submitConfirm, els.autoSave]
   .forEach((el) => el.addEventListener('change', persist));
 
 restore();

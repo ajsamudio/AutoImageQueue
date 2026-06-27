@@ -124,6 +124,7 @@ textarea:focus { outline: 1px solid var(--accent); }
   margin-bottom: 10px;
 }
 .field > span { font-size: 12px; color: var(--muted); }
+.hint-inline { font-size: 11px; opacity: .8; font-weight: 400; }
 .field select,
 .field input {
   background: var(--card2);
@@ -134,6 +135,25 @@ textarea:focus { outline: 1px solid var(--accent); }
   font: inherit;
 }
 
+/* a checkbox + its caption sitting on one row */
+.field.check-field {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+.field.check-field input {
+  width: auto;
+  flex: 0 0 auto;
+  padding: 0;
+  accent-color: var(--accent);
+}
+.field.check-field > span { font-size: 12px; color: var(--muted); }
+.field.check-field code {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+  color: var(--text);
+}
+
 .queue-head {
   display: flex;
   align-items: center;
@@ -141,6 +161,7 @@ textarea:focus { outline: 1px solid var(--accent); }
   gap: 8px;
 }
 .queue-head .btn { width: auto; }
+.queue-head-btns { display: flex; gap: 6px; }
 
 .queue {
   list-style: none;
@@ -175,11 +196,32 @@ textarea:focus { outline: 1px solid var(--accent); }
 }
 .queue li .txt {
   flex: 1;
+  min-width: 0;                  /* let the flex child shrink so long words wrap */
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+/* the parsed "[mm:ss] Scene_Name" label — names the saved file; stays in view */
+.queue li .txt .label {
+  font-weight: 700;
+  font-size: 11px;
+  color: var(--accent);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.queue li .txt .body {
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 3.6em;
-  overflow: hidden;
+  max-height: 4.5em;             /* ~3 lines, then the caption scrolls on its own */
+  overflow-y: auto;
+  overscroll-behavior: contain;  /* keep the wheel inside the caption — don't chain to the queue */
+  padding-right: 4px;
 }
+/* thin scrollbar for the per-caption scroll area */
+.queue li .txt .body::-webkit-scrollbar { width: 6px; }
+.queue li .txt .body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 999px; }
+.queue li .txt .body::-webkit-scrollbar-track { background: transparent; }
 .queue li .badge {
   flex: 0 0 auto;
   font-size: 10px;

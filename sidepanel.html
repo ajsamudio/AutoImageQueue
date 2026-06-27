@@ -58,7 +58,10 @@ Prompt 3"></textarea>
   <section class="card">
     <div class="card-title queue-head">
       <span>Queue</span>
-      <button id="downloadAllBtn" class="btn ghost small" disabled>Download all</button>
+      <div class="queue-head-btns">
+        <button id="downloadPageBtn" class="btn ghost small" title="Rescue: download every result image currently on the page, ignoring queue status">Download page</button>
+        <button id="downloadAllBtn" class="btn ghost small" disabled>Download all</button>
+      </div>
     </div>
     <ol id="queueList" class="queue"></ol>
   </section>
@@ -88,6 +91,19 @@ Prompt 3"></textarea>
     </label>
 
     <label class="field">
+      <span>Max concurrent generations <span class="hint-inline">(1 = one at a time · 0 = unlimited/blast)</span></span>
+      <input id="maxConcurrent" type="number" min="0" max="999" value="1" />
+    </label>
+
+    <label class="field">
+      <span>Result order (concurrent)</span>
+      <select id="resultOrder">
+        <option value="newest">Newest first (most galleries)</option>
+        <option value="oldest">Oldest first</option>
+      </select>
+    </label>
+
+    <label class="field">
       <span>Delay between prompts (sec)</span>
       <input id="delaySec" type="number" min="0" step="0.5" value="1.5" />
     </label>
@@ -107,6 +123,11 @@ Prompt 3"></textarea>
         <option value="clear">Prompt box clears after submit (Google Flow)</option>
         <option value="none">Don't verify — box keeps text (Higgsfield)</option>
       </select>
+    </label>
+
+    <label class="field check-field">
+      <input id="autoSave" type="checkbox" checked />
+      <span>Auto-save each image when it finishes, named by its <code>[mm-ss] Scene_Name</code> label</span>
     </label>
 
     <div class="pick-row">

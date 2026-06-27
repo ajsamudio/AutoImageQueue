@@ -43,9 +43,50 @@ just re-pick.
    Prompt 3
    ```
 
+   Optionally prefix each prompt with a **label** in the form
+   `[mm:ss] Scene_Name | ` (see [Labels & auto-naming](#labels--auto-naming)).
    The counter shows how many were detected. Click **Load into queue**.
 6. **3 · Run → Start**. Keep the Flow tab and the side panel open, and walk away.
-   **Stop** aborts after the current prompt's wait.
+   **Stop** aborts after the current prompt's wait. As each image finishes it is
+   downloaded automatically, named by its label.
+
+## Labels & auto-naming
+
+The upstream "master prompt" can emit each queue line with a leading label:
+
+```
+[mm:ss] Short_Scene_Name | <the actual image prompt text>
+```
+
+For example:
+
+```
+[00:09] Dark_cave_no_fire | Hand-drawn 2D doodle cartoon animation, a stick figure…
+```
+
+Each line is split on the **first `" | "`** (space-pipe-space):
+
+- **Only the right side** (the prompt text) is typed into Flow. The
+  `[mm:ss] Short_Scene_Name | ` label is **never** sent to Flow, so it can't be
+  rendered into the image.
+- **The left side** is remembered for that queue item and used to name the saved
+  file: `[mm:ss] Short_Scene_Name` becomes **`[mm-ss] Short_Scene_Name.<ext>`**
+  (the `:` is swapped for `-` because Windows filenames can't contain `:`; any
+  other illegal character is sanitized too). If two scenes share a name, the
+  later ones get `_2`, `_3`, … appended.
+
+A line with **no `" | "`** is treated entirely as the prompt (backward
+compatible). In that case the filename falls back to a leading `[mm:ss]` found
+inside the prompt text, or to the queue position (`prompt-007`).
+
+**Auto-save** is on by default (toggle it under **Settings → Auto-save each
+image…**). With it on, finished images are downloaded via Chrome's downloads API
+the moment they're captured — no more matching Flow blob sizes to files by hand.
+Each image is saved once per run; **Reset statuses** clears that so a re-run
+saves again. The **Download all** / **Download page** buttons still work as a
+manual fallback and use the same naming. For exact image-to-label pairing,
+**pick a result thumbnail** (Settings) so the extension can scope to real result
+tiles.
 
 ## Completion detection (Settings)
 
