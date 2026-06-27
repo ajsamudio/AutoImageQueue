@@ -96,6 +96,23 @@ if (!window.__AUTOQUE_LOADED__) {
     return false;
   }
 
+  // ---------- "did a generation just start?" ----------
+  // A visible progress badge like "43%" — Google Flow renders one on the
+  // in-progress tile. This is proof a generation actually started even on Flow
+  // builds that KEEP the prompt text in the box after submitting (or clear it
+  // slowly), which otherwise tripped a false "not submitted" error while the
+  // image was genuinely generating.
+  function progressVisible() {
+    const nodes = document.querySelectorAll('span, div, p');
+    for (const el of nodes) {
+      if (el.childElementCount > 0) continue;            // leaf (text-bearing) only
+      const t = (el.textContent || '').trim();
+      if (t.length > 5) continue;                        // "43%", "5%", "100%"
+      if (/^\d{1,3}\s*%$/.test(t) && visible(el)) return true;
+    }
+    return false;
+  }
+
   // ---------- selector building / resolving ----------
   // We store, for each target, an object: { css, text, tag, ariaLabel }.
   // At runtime we try the CSS path first, then fall back to a text/aria match,
@@ -205,6 +222,180 @@ if (!window.__AUTOQUE_LOADED__) {
       });
     });
     return urls;
+  }
+
+  // ---------- failed-generation detection ----------
+  // A generation can be REJECTED after a successful submit (e.g. Flow's policy
+  // block: "This generation might violate our policies"). Such a tile renders no
+  // image, so it must be recognised — otherwise the batch waits forever for an
+  // image that never comes, and concurrent attribution shifts by one (every
+  // later prompt inherits the next one's image).
+  const FAIL_PHRASES = [
+    'violate our policies',
+    'try a different prompt',
+    "couldn't generate",
+    'could not generate',
+    'generation failed'
+  ];
+
+  function looksFailed(text) {
+    const t = (text || '').toLowerCase();
+    if (FAIL_PHRASES.some((p) => t.includes(p))) return true;
+    // A short, standalone "Failed" label (avoid matching long paragraphs).
+    return t.length <= 24 && /\bfailed\b/.test(t);
+  }
+
+  // Ordered terminal result tiles, when the user has picked a result thumbnail
+  // (so we can scope to per-tile elements). Each entry is { kind:'image', url }
+  // or { kind:'failed' }, in DOM order; in-progress tiles are omitted. Returns
+  // null when individual tiles can't be isolated (no results pick) — the caller
+  // then falls back to image-only attribution.
+  function collectResultSlots(selectors) {
+    const r = selectors && selectors.results;
+    if (!r || !r.classes) return null;
+    const sel = (r.tag || '*') + '.' +
+      r.classes.trim().split(/\s+/).map((c) => CSS.escape(c)).join('.');
+    let tiles = [];
+    try { tiles = Array.from(document.querySelectorAll(sel)); } catch (e) { return null; }
+    if (!tiles.length) return null;
+
+    const slots = [];
+    const seen = new Set();
+    tiles.forEach((tile) => {
+      const imgs = (tile.tagName === 'IMG') ? [tile] : Array.from(tile.querySelectorAll('img'));
+      let url = '';
+      for (const img of imgs) {
+        const src = img.currentSrc || img.src || '';
+        if (!/^https?:/i.test(src) || seen.has(src)) continue;
+        const w = img.naturalWidth || img.width;
+        const h = img.naturalHeight || img.height;
+        if (w < 100 || h < 100) continue;
+        url = src;
+        break;
+      }
+      if (url) { seen.add(url); slots.push({ kind: 'image', url }); return; }
+      if (looksFailed(tile.textContent)) slots.push({ kind: 'failed' });
+      // otherwise in-progress / empty -> not a terminal slot, skip
+    });
+    return slots;
+  }
+
+  // Count failed-generation tiles on the page. Uses per-tile slots when a result
+  // thumbnail is picked; otherwise scans leaf text nodes for the failure copy so
+  // the batch can still finish cleanly (count only, no positional attribution).
+  function countFailedTiles(selectors) {
+    const slots = collectResultSlots(selectors);
+    if (slots) return slots.filter((s) => s.kind === 'failed').length;
+    let n = 0;
+    const nodes = document.querySelectorAll('span, div, p');
+    for (const el of nodes) {
+      if (el.childElementCount > 0) continue; // leaf only -> one hit per tile
+      if (looksFailed(el.textContent)) n++;
+    }
+    return n;
+  }
+
+  // ---------- harvest (scroll + accumulate) ----------
+  // Galleries like Flow VIRTUALIZE: only tiles near the viewport keep a loaded
+  // <img>, so one snapshot sees a fraction of the results. Harvesting scrolls
+  // the gallery top→bottom, collecting result URLs as they stream in, and keeps
+  // the union (insertion order ≈ creation/submission order). Survives tiles
+  // unloading once scrolled past.
+  function findScrollContainer(selectors) {
+    let el = resolveEl(selectors && selectors.results);
+    if (!el) {
+      const big = Array.from(document.querySelectorAll('img'))
+        .find((im) => (im.naturalWidth || im.width) >= 150 && (im.naturalHeight || im.height) >= 150);
+      el = big || null;
+    }
+    let node = el;
+    while (node && node !== document.body) {
+      const s = getComputedStyle(node);
+      if (/(auto|scroll)/.test(s.overflowY + ' ' + s.overflow) &&
+          node.scrollHeight > node.clientHeight + 20) return node;
+      node = node.parentElement;
+    }
+    return document.scrollingElement || document.documentElement;
+  }
+
+  // Ordered terminal slots currently in the DOM: { kind:'image', url } |
+  // { kind:'failed' }. Uses per-tile scope when a result thumbnail is picked
+  // (cleaner — excludes avatars/UI images); else walks the document in order,
+  // emitting qualifying result images and failed markers.
+  function orderedSlotsNow(selectors) {
+    const viaTiles = collectResultSlots(selectors);
+    if (viaTiles) return viaTiles;
+    const out = [];
+    const seen = new Set();
+    const nodes = document.querySelectorAll('img, span, div, p');
+    for (const el of nodes) {
+      if (el.tagName === 'IMG') {
+        const src = el.currentSrc || el.src || '';
+        if (!/^https?:/i.test(src) || seen.has(src)) continue;
+        const w = el.naturalWidth || el.width;
+        const h = el.naturalHeight || el.height;
+        if (w < 100 || h < 100) continue;
+        seen.add(src);
+        out.push({ kind: 'image', url: src });
+      } else if (el.childElementCount === 0 && looksFailed(el.textContent)) {
+        out.push({ kind: 'failed' });
+      }
+    }
+    return out;
+  }
+
+  async function harvestAllResults(selectors, settings) {
+    const c = findScrollContainer(selectors);
+    const win = (c === document.scrollingElement || c === document.documentElement || c === document.body);
+    const result = [];          // ordered terminal slots, top→bottom
+    const seenImg = new Set();   // image URLs already placed
+    // Merge the current viewport's ordered slots into `result`, anchoring on the
+    // last already-seen image so overlap from the previous step isn't re-added
+    // and failed markers land (in order) in the newly revealed region.
+    const merge = () => {
+      const cur = orderedSlotsNow(selectors);
+      let lastSeen = -1;
+      for (let i = 0; i < cur.length; i++) {
+        if (cur[i].kind === 'image' && seenImg.has(cur[i].url)) lastSeen = i;
+      }
+      for (let i = lastSeen + 1; i < cur.length; i++) {
+        const s = cur[i];
+        if (s.kind === 'image') {
+          if (!seenImg.has(s.url)) { seenImg.add(s.url); result.push(s); }
+        } else {
+          result.push({ kind: 'failed' });
+        }
+      }
+    };
+    const max = () => win ? ((document.scrollingElement.scrollHeight) - window.innerHeight)
+                          : (c.scrollHeight - c.clientHeight);
+    const view = () => win ? window.innerHeight : c.clientHeight;
+    const go = (y) => { if (win) window.scrollTo(0, y); else c.scrollTop = y; };
+
+    const stepDelay = settings.harvestDelayMs || 450;
+    const wallStop = Date.now() + (settings.harvestMaxMs || 120000);
+
+    go(0); await sleepA(500); merge();
+    let pos = 0, stagnant = 0;
+    for (let i = 0; i < 600; i++) {
+      if (aborted) break;
+      if (Date.now() > wallStop) break;
+      const m = max();
+      const atBottom = pos >= m - 2;
+      if (atBottom) {
+        const before = result.length;
+        await sleepA(stepDelay); merge();
+        if (result.length === before) { stagnant++; if (stagnant >= 2) break; }
+        else stagnant = 0;
+        continue; // give infinite-scroll a chance to grow scrollHeight
+      }
+      pos = Math.min(pos + Math.round(view() * 0.8), m); // 0.8 keeps an image anchor in view
+      go(pos);
+      await sleepA(stepDelay);
+      merge();
+    }
+    go(0); // restore
+    return result;
   }
 
   // ---------- typing into the input ----------
@@ -435,6 +626,79 @@ if (!window.__AUTOQUE_LOADED__) {
     await sleepA(settings.settleMs || 1500);
   }
 
+  // ---------- type + submit (shared) ----------
+  // Type a prompt into the input and submit it, returning once the submit has
+  // been ACCEPTED (or the confirm window lapses). Shared by RUN_ONE (sequential,
+  // waits for completion afterward) and SUBMIT_ONE (concurrent, fire-and-forget).
+  // Throws only when the input is missing or the text never lands — both
+  // unrecoverable. The submit-confirmation is non-fatal: newer Flow builds keep
+  // the prompt text and render progress slowly, so a "couldn't confirm" timeout
+  // is usually a false alarm while the image is in fact generating.
+  async function typeAndSubmit(msg) {
+    const picked = resolveEl(msg.selectors.input);
+    if (!picked) throw new Error('Prompt input not found — re-pick the prompt field.');
+    const editable = findEditable(picked) || picked;
+
+    // Focus the box with a REAL mouse click (CDP). JS .focus() is unreliable for
+    // Flow's editor; CDP keystrokes go to whatever is focused.
+    const c = centerOf(editable);
+    await bg({ type: 'CDP_CLICK', x: c.x, y: c.y });
+    editable.focus(); // backup for the synthetic path
+    await sleep(150);
+
+    // Primary: real (trusted) per-character typing via the debugger so Flow's
+    // editor registers the prompt (CDP_TYPE clears the field first). Fallback:
+    // synthetic events for apps that don't need CDP.
+    const typed = await bg({ type: 'CDP_TYPE', text: msg.text });
+    if (!typed.ok) {
+      clearEditable(editable);
+      setValue(picked, msg.text);
+    }
+
+    // Verify the text actually landed; if not, surface why.
+    await sleep(250);
+    if (currentText(editable).trim() === '') {
+      throw new Error(typed.ok ? 'Typed text did not appear in the box.' : typed.error);
+    }
+
+    await sleep(550); // let the framework un-ghost the button
+
+    const method = msg.settings.submitMethod || 'button';
+    const genEl = msg.selectors.generate ? resolveEl(msg.selectors.generate) : null;
+    await submit(editable, genEl, method, typed.ok);
+
+    // Blast mode (Max concurrent = 0): don't wait to confirm each submit — the
+    // Enter/click was already awaited above, so just settle briefly so it
+    // registers before the next prompt clears and reuses the box.
+    const blast = Number(msg.settings.maxConcurrent) === 0;
+
+    // Confirm the submit registered (non-fatal): the box clears (classic Flow),
+    // a progress badge appears, or the Generate button goes disabled.
+    const skipClearCheck = msg.settings.submitConfirm === 'none' || !!BUSY_WORDS[location.host];
+    if (blast) {
+      await sleep(300);
+    } else if (!skipClearCheck) {
+      const confirmMs = msg.settings.submitConfirmMs || 6000;
+      const progressBefore = progressVisible();
+      const genWasEnabled = !!(genEl && isEnabled(genEl));
+      const confirmed = await until(() => {
+        if (currentText(editable).trim() === '') return true;
+        if (!progressBefore && progressVisible()) return true;
+        const g = msg.selectors.generate ? resolveEl(msg.selectors.generate) : genEl;
+        if (genWasEnabled && g && !isEnabled(g)) return true;
+        return false;
+      }, confirmMs, 250);
+      if (!confirmed) {
+        // Use debug (not warn/error) so this expected, non-fatal case doesn't
+        // pile up on chrome://extensions ▸ Errors. On Flow builds that keep the
+        // prompt text in the box, "couldn't confirm" is the normal path.
+        console.debug('[AutoQuePrompt] Could not confirm submission within '
+          + Math.round(confirmMs / 1000) + 's — proceeding anyway (generation may be slow to appear).');
+      }
+    }
+    return { editable, genEl };
+  }
+
   // ---------- element picker ----------
   function pickerLabel(target) {
     return ({
@@ -533,14 +797,40 @@ if (!window.__AUTOQUE_LOADED__) {
         return true; // async: respond after the user clicks / cancels
       }
 
+      // Current result-image URLs on the page. The side panel diffs these
+      // against a pre-batch baseline to attribute concurrent generations.
+      case 'SNAPSHOT': {
+        let images = [], slots = null, failed = 0;
+        try { images = collectResultImages(msg.selectors); } catch (e) { /* ignore */ }
+        try { slots = collectResultSlots(msg.selectors); } catch (e) { slots = null; }
+        try { failed = countFailedTiles(msg.selectors); } catch (e) { failed = 0; }
+        sendResponse({ ok: true, images, slots, failed });
+        return false;
+      }
+
+      // Scroll the whole gallery and accumulate every terminal result tile, in
+      // order (handles virtualized galleries that only keep nearby tiles loaded).
+      // Returns ordered slots (image|failed) so the caller keeps failures in
+      // position; `images` is included for older callers.
+      case 'HARVEST': {
+        aborted = false;
+        (async () => {
+          try {
+            const slots = await harvestAllResults(msg.selectors, msg.settings || {});
+            const images = slots.filter((s) => s.kind === 'image').map((s) => s.url);
+            sendResponse({ ok: true, slots, images });
+          } catch (e) {
+            sendResponse({ ok: false, error: e.message || String(e) });
+          }
+        })();
+        return true; // async
+      }
+
+      // Sequential: type, submit, WAIT for this generation to finish, capture it.
       case 'RUN_ONE': {
         aborted = false;
         (async () => {
           try {
-            const picked = resolveEl(msg.selectors.input);
-            if (!picked) throw new Error('Prompt input not found — re-pick the prompt field.');
-            const editable = findEditable(picked) || picked;
-
             // One-at-a-time apps (e.g. Higgsfield): never start typing/submitting
             // while a generation is still running, or the new submit is rejected
             // ("concurrent" error / refunded credits). Wait for the app to go idle
@@ -560,54 +850,7 @@ if (!window.__AUTOQUE_LOADED__) {
             // the one THIS prompt produces (anything new after it finishes).
             const beforeImages = new Set(collectResultImages(msg.selectors));
 
-            // Focus the box with a REAL mouse click (CDP). JS .focus() is not
-            // reliable for Flow's editor, and CDP keystrokes go to whatever is
-            // focused — so this is what makes typing land every time.
-            const c = centerOf(editable);
-            const clicked = await bg({ type: 'CDP_CLICK', x: c.x, y: c.y });
-            editable.focus(); // backup for the synthetic path
-            await sleep(150);
-
-            // Primary: real (trusted) per-character typing via the debugger so
-            // Flow's editor registers the prompt. CDP_TYPE clears the field first.
-            // Fallback: synthetic events for apps that don't need CDP.
-            const typed = await bg({ type: 'CDP_TYPE', text: msg.text });
-            if (!typed.ok) {
-              clearEditable(editable);
-              setValue(picked, msg.text);
-            }
-
-            // Verify the text actually landed; if not, surface why.
-            await sleep(250);
-            if (currentText(editable).trim() === '') {
-              throw new Error(typed.ok ? 'Typed text did not appear in the box.' : typed.error);
-            }
-
-            // Let the framework un-ghost the button.
-            await sleep(550);
-
-            const method = msg.settings.submitMethod || 'button';
-            const genEl = msg.selectors.generate ? resolveEl(msg.selectors.generate) : null;
-            await submit(editable, genEl, method, typed.ok);
-
-            // Confirm the submission was ACCEPTED. Flow clears the prompt box on a
-            // successful submit; if our text is still sitting there, the generation
-            // never started. The box can take a second or two to clear, so POLL for
-            // it rather than checking once — a single early check produced false
-            // "not submitted" errors on prompts that did in fact go through.
-            //
-            // Some apps (e.g. Higgsfield) KEEP the prompt text after submitting, so
-            // this check would false-error there. Skip it for known one-at-a-time
-            // hosts (their generation start is confirmed by the busy badge instead)
-            // and when the user sets "Confirm submission" to "Don't verify".
-            const skipClearCheck = msg.settings.submitConfirm === 'none' || !!BUSY_WORDS[location.host];
-            if (!skipClearCheck) {
-              const confirmMs = msg.settings.submitConfirmMs || 6000;
-              const submitted = await until(() => currentText(editable).trim() === '', confirmMs, 250);
-              if (!submitted) {
-                throw new Error('Typed but not submitted — box still full after ' + Math.round(confirmMs / 1000) + 's (Generate stayed disabled). Re-pick the Generate button, set Submit method to "Both", or set Confirm submission to "Don\'t verify".');
-              }
-            }
+            const { genEl } = await typeAndSubmit(msg);
 
             await waitForReady(genEl, msg.settings, msg.selectors);
 
@@ -619,6 +862,22 @@ if (!window.__AUTOQUE_LOADED__) {
             } catch (e) { /* ignore */ }
 
             sendResponse({ ok: true, images });
+          } catch (e) {
+            sendResponse({ ok: false, error: e.message || String(e) });
+          }
+        })();
+        return true; // async
+      }
+
+      // Concurrent: type + submit only, then return immediately so the side panel
+      // can fire the next prompt while this one generates. Result capture is done
+      // by the side panel via SNAPSHOT diffing once everything finishes.
+      case 'SUBMIT_ONE': {
+        aborted = false;
+        (async () => {
+          try {
+            await typeAndSubmit(msg);
+            sendResponse({ ok: true });
           } catch (e) {
             sendResponse({ ok: false, error: e.message || String(e) });
           }
