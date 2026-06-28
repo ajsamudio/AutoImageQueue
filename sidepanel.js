@@ -436,8 +436,33 @@ async function runConcurrent(settings, usedNames) {
     };
   };
 
+  // Like snapshot(), but scrolls the WHOLE gallery first. Flow virtualizes —
+  // only tiles near the viewport keep a loaded <img>, and the newest images
+  // decode last — so a single SNAPSHOT can miss the most recent generations and
+  // mis-score them as failures. HARVEST collects every terminal tile in order,
+  // which is what attribution (baseline diff + final pass) needs to be exact.
+  // Returns null if the harvest fails, so callers can fall back to snapshot().
+  const harvestSnap = async () => {
+    const r = await sendToTab(connectedTabId, {
+      type: 'HARVEST',
+      selectors,
+      settings: {
+        harvestDelayMs: settings.harvestDelayMs || 450,
+        harvestMaxMs: settings.harvestMaxMs || 120000
+      }
+    });
+    if (!r || !r.ok || !Array.isArray(r.slots)) return null;
+    return {
+      images: r.slots.filter((s) => s.kind === 'image').map((s) => s.url),
+      slots: r.slots,
+      failed: r.slots.filter((s) => s.kind === 'failed').length
+    };
+  };
+
   // Everything already on the page is "old" — new results appear beyond this.
-  const baselineSnap = await snapshot();
+  // Harvest so the baseline is COMPLETE; otherwise pre-existing images the
+  // viewport didn't see would later surface as "new" and shift attribution.
+  const baselineSnap = (await harvestSnap()) || (await snapshot());
   const baselineImages = new Set(baselineSnap.images);
   const baselineFailed = baselineSnap.failed;
   const newOnly = (imgs) => imgs.filter((u) => !baselineImages.has(u));
@@ -586,9 +611,14 @@ async function runConcurrent(settings, usedNames) {
     }
   }
 
-  // Final pass: fresh snapshot, then resolve every submitted prompt.
+  // Final pass: scroll-harvest the whole gallery (not a single viewport) so
+  // every finished image is seen before we settle each prompt. Without this the
+  // newest generations — virtualized out / still decoding — get mis-scored as
+  // errors even though their images exist. Brief settle first so the last tiles
+  // have a moment to finish; fall back to a plain snapshot if harvest fails.
   stopped = !running;
-  lastSnap = await snapshot();
+  if (!stopped) await sleep(settings.settleMs || 1500);
+  lastSnap = (await harvestSnap()) || (await snapshot());
   const finalOutcomes = computeOutcomes();
   completed = Math.min(finalOutcomes.terminal, total - failed);
   attribute(true, finalOutcomes);
